@@ -1556,6 +1556,82 @@ func TestGetIssueUsageReportsUsageCoverage(t *testing.T) {
 	}
 }
 
+func TestGetIssueUsageChildrenRollsUpSubtree(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	var agentID, runtimeID string
+	dbfx.QueryRow(t, `
+		SELECT id, runtime_id FROM agent
+		WHERE workspace_id = $1 AND runtime_id IS NOT NULL
+		LIMIT 1
+	`, testWorkspaceID).Scan(&agentID, &runtimeID)
+
+	parentID := dbfx.Issue(t, "subtree usage parent")
+	childID := dbfx.Issue(t, "subtree usage child")
+	grandchildID := dbfx.Issue(t, "subtree usage grandchild")
+	unrelatedID := dbfx.Issue(t, "subtree usage unrelated")
+	dbfx.Exec(t, `UPDATE issue SET parent_issue_id = $1 WHERE id = $2`, parentID, childID)
+	dbfx.Exec(t, `UPDATE issue SET parent_issue_id = $1 WHERE id = $2`, childID, grandchildID)
+
+	addUsage := func(issueID string, input int64, ticks any) {
+		taskID := dbfx.Task(t, agentID, testutil.Cols{
+			"issue_id":     issueID,
+			"runtime_id":   runtimeID,
+			"status":       "completed",
+			"started_at":   testutil.Raw("now() - interval '2 minutes'"),
+			"completed_at": testutil.Raw("now() - interval '1 minute'"),
+		})
+		cols := testutil.Cols{
+			"task_id":       taskID,
+			"provider":      "claude",
+			"model":         "claude-sonnet-5-5",
+			"input_tokens":  input,
+			"output_tokens": 10,
+		}
+		if ticks != nil {
+			cols["cost_usd_ticks"] = ticks
+		}
+		dbfx.Insert(t, "task_usage", cols)
+	}
+	addUsage(parentID, 100, int64(5000))
+	addUsage(childID, 200, nil)
+	addUsage(grandchildID, 400, int64(7000))
+	addUsage(unrelatedID, 800, int64(9000))
+
+	type usage struct {
+		TotalInputTokens    int64 `json:"total_input_tokens"`
+		TotalOutputTokens   int64 `json:"total_output_tokens"`
+		CostUsdTicks        int64 `json:"cost_usd_ticks"`
+		UncostedInputTokens int64 `json:"uncosted_input_tokens"`
+		TaskCount           int32 `json:"task_count"`
+		MeteredTaskCount    int32 `json:"metered_task_count"`
+		IssueCount          int32 `json:"issue_count"`
+	}
+	get := func(path string) usage {
+		req := newRequest("GET", path, nil)
+		req = withURLParam(req, "id", parentID)
+		var got usage
+		testutil.Call(t, testHandler.GetIssueUsage, req).Want(http.StatusOK).JSON(&got)
+		return got
+	}
+
+	rolled := get("/api/issues/" + parentID + "/usage?children=true")
+	want := usage{
+		TotalInputTokens: 700, TotalOutputTokens: 30, CostUsdTicks: 12000,
+		UncostedInputTokens: 200, TaskCount: 3, MeteredTaskCount: 3, IssueCount: 3,
+	}
+	if rolled != want {
+		t.Errorf("subtree usage = %+v, want %+v", rolled, want)
+	}
+
+	own := get("/api/issues/" + parentID + "/usage")
+	if own.TotalInputTokens != 100 || own.CostUsdTicks != 5000 || own.TaskCount != 1 {
+		t.Errorf("own usage = %+v, want input 100, cost 5000, 1 task", own)
+	}
+}
+
 func TestGetDaemonWorkspaceRepos_WithDaemonToken(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")

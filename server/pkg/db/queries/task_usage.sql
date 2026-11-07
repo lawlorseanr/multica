@@ -113,6 +113,62 @@ SELECT
 FROM usage
 CROSS JOIN terminal_runs;
 
+-- name: GetIssueSubtreeUsageSummary :one
+-- GetIssueUsageSummary's shape, summed over an issue plus every descendant
+-- reached through issue.parent_issue_id. The cost split stays intact: the
+-- authoritative cost_usd_ticks total sits beside the uncosted-token totals
+-- (migration 213), so a client keeps estimating unpriced rows per model
+-- without counting a costed row twice.
+--
+-- UNION (not UNION ALL) dedupes ids so a corrupted parent cycle terminates.
+-- The walk is scoped to @workspace_id and uses idx_issue_workspace_parent
+-- (migration 204); usage rows use the issue_id / task_id indexes
+-- (migrations 035/032).
+WITH RECURSIVE subtree AS (
+    SELECT i.id
+    FROM issue i
+    WHERE i.id = @issue_id AND i.workspace_id = @workspace_id
+    UNION
+    SELECT c.id
+    FROM issue c
+    JOIN subtree s ON c.parent_issue_id = s.id
+    WHERE c.workspace_id = @workspace_id
+), usage AS (
+    SELECT
+        COALESCE(SUM(tu.input_tokens), 0)::bigint AS total_input_tokens,
+        COALESCE(SUM(tu.output_tokens), 0)::bigint AS total_output_tokens,
+        COALESCE(SUM(tu.cache_read_tokens), 0)::bigint AS total_cache_read_tokens,
+        COALESCE(SUM(tu.cache_write_tokens), 0)::bigint AS total_cache_write_tokens,
+        COALESCE(SUM(tu.cost_usd_ticks), 0)::bigint AS total_cost_usd_ticks,
+        COALESCE(SUM(tu.input_tokens)       FILTER (WHERE tu.cost_usd_ticks IS NULL), 0)::bigint AS uncosted_input_tokens,
+        COALESCE(SUM(tu.output_tokens)      FILTER (WHERE tu.cost_usd_ticks IS NULL), 0)::bigint AS uncosted_output_tokens,
+        COALESCE(SUM(tu.cache_read_tokens)  FILTER (WHERE tu.cost_usd_ticks IS NULL), 0)::bigint AS uncosted_cache_read_tokens,
+        COALESCE(SUM(tu.cache_write_tokens) FILTER (WHERE tu.cost_usd_ticks IS NULL), 0)::bigint AS uncosted_cache_write_tokens,
+        COUNT(DISTINCT tu.task_id)::int AS task_count
+    FROM task_usage tu
+    JOIN agent_task_queue atq ON atq.id = tu.task_id
+    WHERE atq.issue_id IN (SELECT id FROM subtree)
+), terminal_runs AS (
+    SELECT
+        COUNT(*)::int AS terminal_task_count,
+        COUNT(*) FILTER (WHERE EXISTS (
+            SELECT 1 FROM task_usage tu WHERE tu.task_id = atq.id
+        ))::int AS metered_task_count
+    FROM agent_task_queue atq
+    WHERE atq.issue_id IN (SELECT id FROM subtree)
+      AND atq.status IN ('completed', 'failed', 'cancelled')
+      AND atq.started_at IS NOT NULL
+      AND atq.completed_at IS NOT NULL
+)
+SELECT
+    usage.*,
+    terminal_runs.terminal_task_count,
+    terminal_runs.metered_task_count,
+    (terminal_runs.terminal_task_count - terminal_runs.metered_task_count)::int AS unreported_task_count,
+    (SELECT COUNT(*) FROM subtree)::int AS issue_count
+FROM usage
+CROSS JOIN terminal_runs;
+
 -- name: ListDashboardUsageDaily :many
 -- Daily per-(date, provider, model) token aggregates for the workspace, served
 -- from the UTC-bucketed `task_usage_hourly` table and

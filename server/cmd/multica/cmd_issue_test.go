@@ -1454,7 +1454,54 @@ func TestRunIssuePullRequestsListsLinkedPRsAsJSON(t *testing.T) {
 func newIssueUsageTestCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "usage"}
 	cmd.Flags().String("output", "table", "")
+	cmd.Flags().Bool("children", false, "")
 	return cmd
+}
+
+func TestRunIssueUsageChildrenRequestsSubtreeRollup(t *testing.T) {
+	var gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/issues/MUL-1":
+			json.NewEncoder(w).Encode(map[string]any{"id": "issue-uuid", "identifier": "MUL-1"})
+		case "/api/issues/issue-uuid/usage":
+			gotQuery = r.URL.RawQuery
+			json.NewEncoder(w).Encode(map[string]any{"cost_usd_ticks": float64(12000), "issue_count": float64(3)})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_TOKEN", "mat_test-token")
+
+	cmd := newIssueUsageTestCmd()
+	_ = cmd.Flags().Set("output", "json")
+	_ = cmd.Flags().Set("children", "true")
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	drainCh := make(chan []byte, 1)
+	go func() { b, _ := io.ReadAll(r); drainCh <- b }()
+	err := runIssueUsage(cmd, []string{"MUL-1"})
+	_ = w.Close()
+	os.Stdout = old
+	out := <-drainCh
+	if err != nil {
+		t.Fatalf("runIssueUsage: %v", err)
+	}
+	if gotQuery != "children=true" {
+		t.Fatalf("query = %q, want children=true", gotQuery)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatalf("decode JSON output: %v\n%s", err, string(out))
+	}
+	if payload["cost_usd_ticks"] != float64(12000) || payload["issue_count"] != float64(3) {
+		t.Fatalf("unexpected payload: %#v", payload)
+	}
 }
 
 func TestRunIssueUsageReturnsTokenSummaryAsJSON(t *testing.T) {

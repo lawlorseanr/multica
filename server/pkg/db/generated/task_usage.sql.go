@@ -11,6 +11,107 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const getIssueSubtreeUsageSummary = `-- name: GetIssueSubtreeUsageSummary :one
+WITH RECURSIVE subtree AS (
+    SELECT i.id
+    FROM issue i
+    WHERE i.id = $1 AND i.workspace_id = $2
+    UNION
+    SELECT c.id
+    FROM issue c
+    JOIN subtree s ON c.parent_issue_id = s.id
+    WHERE c.workspace_id = $2
+), usage AS (
+    SELECT
+        COALESCE(SUM(tu.input_tokens), 0)::bigint AS total_input_tokens,
+        COALESCE(SUM(tu.output_tokens), 0)::bigint AS total_output_tokens,
+        COALESCE(SUM(tu.cache_read_tokens), 0)::bigint AS total_cache_read_tokens,
+        COALESCE(SUM(tu.cache_write_tokens), 0)::bigint AS total_cache_write_tokens,
+        COALESCE(SUM(tu.cost_usd_ticks), 0)::bigint AS total_cost_usd_ticks,
+        COALESCE(SUM(tu.input_tokens)       FILTER (WHERE tu.cost_usd_ticks IS NULL), 0)::bigint AS uncosted_input_tokens,
+        COALESCE(SUM(tu.output_tokens)      FILTER (WHERE tu.cost_usd_ticks IS NULL), 0)::bigint AS uncosted_output_tokens,
+        COALESCE(SUM(tu.cache_read_tokens)  FILTER (WHERE tu.cost_usd_ticks IS NULL), 0)::bigint AS uncosted_cache_read_tokens,
+        COALESCE(SUM(tu.cache_write_tokens) FILTER (WHERE tu.cost_usd_ticks IS NULL), 0)::bigint AS uncosted_cache_write_tokens,
+        COUNT(DISTINCT tu.task_id)::int AS task_count
+    FROM task_usage tu
+    JOIN agent_task_queue atq ON atq.id = tu.task_id
+    WHERE atq.issue_id IN (SELECT id FROM subtree)
+), terminal_runs AS (
+    SELECT
+        COUNT(*)::int AS terminal_task_count,
+        COUNT(*) FILTER (WHERE EXISTS (
+            SELECT 1 FROM task_usage tu WHERE tu.task_id = atq.id
+        ))::int AS metered_task_count
+    FROM agent_task_queue atq
+    WHERE atq.issue_id IN (SELECT id FROM subtree)
+      AND atq.status IN ('completed', 'failed', 'cancelled')
+      AND atq.started_at IS NOT NULL
+      AND atq.completed_at IS NOT NULL
+)
+SELECT
+    usage.total_input_tokens, usage.total_output_tokens, usage.total_cache_read_tokens, usage.total_cache_write_tokens, usage.total_cost_usd_ticks, usage.uncosted_input_tokens, usage.uncosted_output_tokens, usage.uncosted_cache_read_tokens, usage.uncosted_cache_write_tokens, usage.task_count,
+    terminal_runs.terminal_task_count,
+    terminal_runs.metered_task_count,
+    (terminal_runs.terminal_task_count - terminal_runs.metered_task_count)::int AS unreported_task_count,
+    (SELECT COUNT(*) FROM subtree)::int AS issue_count
+FROM usage
+CROSS JOIN terminal_runs
+`
+
+type GetIssueSubtreeUsageSummaryParams struct {
+	IssueID     pgtype.UUID `json:"issue_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+type GetIssueSubtreeUsageSummaryRow struct {
+	TotalInputTokens         int64 `json:"total_input_tokens"`
+	TotalOutputTokens        int64 `json:"total_output_tokens"`
+	TotalCacheReadTokens     int64 `json:"total_cache_read_tokens"`
+	TotalCacheWriteTokens    int64 `json:"total_cache_write_tokens"`
+	TotalCostUsdTicks        int64 `json:"total_cost_usd_ticks"`
+	UncostedInputTokens      int64 `json:"uncosted_input_tokens"`
+	UncostedOutputTokens     int64 `json:"uncosted_output_tokens"`
+	UncostedCacheReadTokens  int64 `json:"uncosted_cache_read_tokens"`
+	UncostedCacheWriteTokens int64 `json:"uncosted_cache_write_tokens"`
+	TaskCount                int32 `json:"task_count"`
+	TerminalTaskCount        int32 `json:"terminal_task_count"`
+	MeteredTaskCount         int32 `json:"metered_task_count"`
+	UnreportedTaskCount      int32 `json:"unreported_task_count"`
+	IssueCount               int32 `json:"issue_count"`
+}
+
+// GetIssueUsageSummary's shape, summed over an issue plus every descendant
+// reached through issue.parent_issue_id. The cost split stays intact: the
+// authoritative cost_usd_ticks total sits beside the uncosted-token totals
+// (migration 213), so a client keeps estimating unpriced rows per model
+// without counting a costed row twice.
+//
+// UNION (not UNION ALL) dedupes ids so a corrupted parent cycle terminates.
+// The walk is scoped to @workspace_id and uses idx_issue_workspace_parent
+// (migration 204); usage rows use the issue_id / task_id indexes
+// (migrations 035/032).
+func (q *Queries) GetIssueSubtreeUsageSummary(ctx context.Context, arg GetIssueSubtreeUsageSummaryParams) (GetIssueSubtreeUsageSummaryRow, error) {
+	row := q.db.QueryRow(ctx, getIssueSubtreeUsageSummary, arg.IssueID, arg.WorkspaceID)
+	var i GetIssueSubtreeUsageSummaryRow
+	err := row.Scan(
+		&i.TotalInputTokens,
+		&i.TotalOutputTokens,
+		&i.TotalCacheReadTokens,
+		&i.TotalCacheWriteTokens,
+		&i.TotalCostUsdTicks,
+		&i.UncostedInputTokens,
+		&i.UncostedOutputTokens,
+		&i.UncostedCacheReadTokens,
+		&i.UncostedCacheWriteTokens,
+		&i.TaskCount,
+		&i.TerminalTaskCount,
+		&i.MeteredTaskCount,
+		&i.UnreportedTaskCount,
+		&i.IssueCount,
+	)
+	return i, err
+}
+
 const getIssueUsageSummary = `-- name: GetIssueUsageSummary :one
 WITH usage AS (
     SELECT

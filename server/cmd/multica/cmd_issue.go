@@ -742,6 +742,7 @@ func init() {
 
 	// issue usage
 	issueUsageCmd.Flags().String("output", "table", "Output format: table or json")
+	issueUsageCmd.Flags().Bool("children", false, "Roll usage up across the issue and all its sub-issues, including cost_usd_ticks and the uncosted token split")
 
 	// issue rerun
 	issueRerunCmd.Flags().String("output", "json", "Output format: table or json")
@@ -2979,8 +2980,13 @@ func runIssueUsage(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolve issue: %w", err)
 	}
 
+	usagePath := "/api/issues/" + url.PathEscape(issueRef.ID) + "/usage"
+	if children, _ := cmd.Flags().GetBool("children"); children {
+		usagePath += "?children=true"
+	}
+
 	var result map[string]any
-	if err := client.GetJSON(ctx, "/api/issues/"+url.PathEscape(issueRef.ID)+"/usage", &result); err != nil {
+	if err := client.GetJSON(ctx, usagePath, &result); err != nil {
 		return fmt.Errorf("get issue usage: %w", err)
 	}
 

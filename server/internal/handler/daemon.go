@@ -6595,6 +6595,11 @@ func (h *Handler) GetIssueUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.URL.Query().Get("children") == "true" {
+		h.writeIssueSubtreeUsage(w, r, issue)
+		return
+	}
+
 	row, err := h.Queries.GetIssueUsageSummary(r.Context(), issue.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to get issue usage")
@@ -6619,6 +6624,37 @@ func (h *Handler) GetIssueUsage(w http.ResponseWriter, r *http.Request) {
 		"terminal_task_count":   row.TerminalTaskCount,
 		"metered_task_count":    row.MeteredTaskCount,
 		"unreported_task_count": row.UnreportedTaskCount,
+	})
+}
+
+// writeIssueSubtreeUsage answers GET /usage?children=true: the same body as the
+// per-issue summary, summed over the issue and all its descendants, plus
+// issue_count (the issue itself included).
+func (h *Handler) writeIssueSubtreeUsage(w http.ResponseWriter, r *http.Request, issue db.Issue) {
+	row, err := h.Queries.GetIssueSubtreeUsageSummary(r.Context(), db.GetIssueSubtreeUsageSummaryParams{
+		IssueID:     issue.ID,
+		WorkspaceID: issue.WorkspaceID,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get issue usage")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total_input_tokens":          row.TotalInputTokens,
+		"total_output_tokens":         row.TotalOutputTokens,
+		"total_cache_read_tokens":     row.TotalCacheReadTokens,
+		"total_cache_write_tokens":    row.TotalCacheWriteTokens,
+		"cost_usd_ticks":              row.TotalCostUsdTicks,
+		"uncosted_input_tokens":       row.UncostedInputTokens,
+		"uncosted_output_tokens":      row.UncostedOutputTokens,
+		"uncosted_cache_read_tokens":  row.UncostedCacheReadTokens,
+		"uncosted_cache_write_tokens": row.UncostedCacheWriteTokens,
+		"task_count":                  row.TaskCount,
+		"terminal_task_count":         row.TerminalTaskCount,
+		"metered_task_count":          row.MeteredTaskCount,
+		"unreported_task_count":       row.UnreportedTaskCount,
+		"issue_count":                 row.IssueCount,
 	})
 }
 
